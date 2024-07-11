@@ -1,0 +1,1295 @@
+library(simstudy)
+library(tidyverse)
+library(data.table)
+library(tibble)
+library(ggplot2)
+library(pracma)
+library(calculus)
+library(dplyr)
+library(ggfortify)
+library(haven)
+library(numDeriv)
+library(functional)
+library(moments)
+library(lmtest)
+library(sandwich)
+library(alr4)
+library(ggplot2)
+library(hrbrthemes)
+library(gridExtra)
+library(ggpubr)
+library(evd)
+library(haven)
+library(MASS)
+library(ggtext)
+library(patchwork)
+
+cons_pi=pi
+set.seed(3624)
+
+###########################################################################################
+# THE FIRST PART OF THE FILE CONTAINS THE FUNCTIONS FOR FITTING RBCs WITH BINARY OUTCOMES #
+#    Skip to line 593 for the generation and analysis of the simulated data               #
+###########################################################################################
+
+#the flow library:
+rd <- function(P,eta) {
+  P+eta
+}
+rr <- function(P,eta) {
+  P*exp(eta)
+}
+sr <- function(P,eta) {
+  1-(1-P)*exp(eta)
+}
+or <- function(P,eta) {
+  P*exp(eta)/(P*exp(eta)+1-P)
+}
+srr <- function(P,eta) {
+  ifelse(eta<=0,P*exp(eta),1-(1-P)*exp(-eta))
+}
+probit <- function(P,eta){
+  pnorm(qnorm(P)+eta) 
+}
+loglog <- function(P,eta){
+  P^(exp(eta)) 
+}
+cloglog <- function(P,eta){
+  1-(1-P)^(exp(eta)) 
+}
+cauchit <- function(P,eta){
+  atan(tan(cons_pi*(P-0.5))+eta)/cons_pi+0.5
+}
+arcsine <- function(P,eta){
+  sin(asin(sqrt(P))+eta)^2
+}
+
+
+
+
+#Frechet derivatives wrt eta:
+De.rd <- function(P,eta) {
+  function(h) {
+    h
+  }
+}
+De.rr <- function(P,eta) {
+  function(h) {
+    P*exp(eta)*h
+  }
+}
+De.sr <- function(P,eta) {
+  function(h) {
+    -(1-P)*exp(eta)*h
+  }
+}
+De.or <- function(P,eta) {
+  function(h) {
+    (P*(1-P)*exp(eta)/((P*exp(eta)+1-P)^2))*h
+  }
+}
+De.srr <- function(P,eta) {
+  function(h) {
+    (ifelse(eta<=0,P*exp(eta),(1-P)*exp(-eta)))*h
+  }
+}
+De.probit <- function(P,eta){
+  function(h) {
+    dnorm(qnorm(P)+eta)*h
+  }
+}
+De.loglog <- function(P,eta){
+  function(h) {
+    (P^(exp(eta)))*exp(eta)*log(P)*h
+  }
+}
+De.cloglog <- function(P,eta){
+  function(h) {
+    -((1-P)^(exp(eta)))*exp(eta)*log(1-P)*h
+  }
+}
+De.cauchit <- function(P,eta){
+  function(h) {
+    (1/cons_pi)*(1/(1+(tan(cons_pi*(P-0.5))+eta)^2))*h
+  }
+}
+De.arcsine <- function(P,eta){
+  function(h) {
+    2*sin(asin(sqrt(P))+eta)*cos(asin(sqrt(P))+eta)*h
+  }
+}
+
+
+
+
+#Frechet derivatives wrt P:
+DP.rd <- function(P,eta) {
+  function(h) {
+    h
+  }
+}
+DP.rr <- function(P,eta) {
+  function(h) {
+    exp(eta)*h
+  }
+}
+DP.sr <- function(P,eta) {
+  function(h) {
+    exp(eta)*h
+  }
+}
+DP.or <- function(P,eta) {
+  function(h) {
+    (exp(eta)/((P*exp(eta)+1-P)^2))*h
+  }
+}
+DP.srr <- function(P,eta) {
+  function(h) {
+    exp(ifelse(eta<=0,1,-1)*eta)*h
+  }
+}
+DP.probit <- function(P,eta){
+  function(h) {
+    ((dnorm(qnorm(P)+eta))/(dnorm(qnorm(P))))*h
+  }
+}
+DP.loglog <- function(P,eta){
+  function(h) {
+    exp(eta)*(P^(exp(eta)-1))*h
+  }
+}
+DP.cloglog <- function(P,eta){
+  function(h) {
+    exp(eta)*((1-P)^(exp(eta)-1))*h
+  }
+}
+DP.cauchit <- function(P,eta){
+  function(h) {
+    ((sec(cons_pi*(P-0.5))^2)/(1+(tan(cons_pi*(P-0.5))+eta)^2))*h
+  }
+}
+DP.arcsine <- function(P,eta){
+  function(h) {
+    (sin(asin(sqrt(P))+eta)*cos(asin(sqrt(P))+eta)/(sqrt(P*(1-P))))*h
+  }
+}
+
+
+
+#NB f_spec will contain, for each variable-set DXj, which of these flows should be used for which covariate. 
+
+
+P0 <- function(data,p0) {
+  n=nrow(data)
+  vector("numeric",length=n)+p0
+}
+
+
+make_etaj <- function(DXj,betaj) {
+  #betaj should be an array with dimensions k and l - k is the number of columns in DXj and l=1 for now.
+  Kj=ncol(as.matrix(DXj))
+  n=nrow(as.matrix(DXj))
+  DXj_array=array(as.matrix(DXj),dim=c(i1=n,k=Kj))
+  etaj=einstein(DXj_array,betaj)
+  Db.etaj <- function(h) {
+    einstein(DXj_array,h)
+  }
+  return(list(etaj,Db.etaj))
+}
+
+#this function composes the flows together up to step "step" - usually this will be applied with step = number of covariates, i.e. all the steps.
+f_compose <- function(data,f_spec,beta,p0,step) {
+  m=length(f_spec)
+  n=nrow(data)
+  DX=as.data.frame(as.data.table(data[ , grepl( "^DX"  , names( data ) ) ,drop = FALSE]))
+  maxDX=as.data.frame(as.data.table(data[ , grepl( "^maxDX"  , names( data ) ) ,drop = FALSE]))
+  eta=vector("list",step)
+  etamax=vector("list",step)
+  for (j in 1:m) {
+    DXj=as.data.frame(as.data.table(DX[ , grepl( paste("^DX",j,".",sep="") , names( DX ) ) ,drop = FALSE]))
+    etaj=make_etaj(DXj,beta[[j]])
+    eta[[j]] <- etaj[[1]]
+    DXmaxj=as.data.frame(as.data.table(maxDX[ , grepl( paste("^maxDX",j,".",sep="") , names( maxDX ) ) ,drop = FALSE]))
+    if (ncol(DXmaxj)>0) {
+      etamaxj=make_etaj(DXmaxj,beta[[j]])
+      etamax[[j]] <- etamaxj[[1]]
+    }
+  }
+  
+  fs=vector("list",step)
+  for (j in 1:step) {
+    if (f_spec[j]==0) {
+      fs[[j]] <- Curry(rd, eta = eta[[j]][,1])
+    }
+    if (f_spec[j]==1) {
+      fs[[j]] <- Curry(rr, eta = eta[[j]][,1])
+    }
+    if (f_spec[j]==2) {
+      fs[[j]] <- Curry(sr, eta = eta[[j]][,1])
+    }
+    if (f_spec[j]==3) {
+      fs[[j]] <- Curry(or, eta = eta[[j]][,1])
+    }
+    if (f_spec[j]==4) {
+      fs[[j]] <- Curry(srr, eta = eta[[j]][,1])
+    }
+    if (f_spec[j]==5) {
+      fs[[j]] <- Curry(probit, eta = eta[[j]][,1])
+    }
+    if (f_spec[j]==6) {
+      fs[[j]] <- Curry(loglog, eta = eta[[j]][,1])
+    }
+    if (f_spec[j]==7) {
+      fs[[j]] <- Curry(cloglog, eta = eta[[j]][,1])
+    }
+    if (f_spec[j]==8) {
+      fs[[j]] <- Curry(cauchit, eta = eta[[j]][,1])
+    }
+    if (f_spec[j]==9) {
+      fs[[j]] <- Curry(arcsine, eta = eta[[j]][,1])
+    }
+    if (f_spec[j]==10) {
+      v=(which(f_spec!=10)*(which(f_spec!=10)>j))
+      v[v==0]<-max(v)+1
+      k=min(v)
+      fs[[j]] <- Curry(opr, eta = eta[[j]][,1], etamax = etamax[[k]][,1])
+    }
+  }
+  P0vec=P0(data,p0)
+  do.call(Compose, fs)(P0vec)
+}
+
+
+
+#this function calculates the dimensions of beta
+beta_dims_calc<-function(f_spec,data) {
+  m=length(f_spec)
+  beta_dims<-vector("list",m)
+  DX=as.data.frame(as.data.table(data[ , grepl( "^DX"  , names( data ) ) ]))
+  for (j in 1:m) {
+    DXj=as.data.frame(as.data.table(DX[ , grepl( paste("^DX",j,".",sep="") , names( DX ) ) ]))
+    beta_dims[[j]]<-vector("numeric", length=2)
+    beta_dims[[j]][1] <- ncol(as.matrix(DXj))
+    beta_dims[[j]][2] <- 1
+  }  
+  return(beta_dims)
+}
+
+#turn beta into one long vector
+bvec<-function(beta,beta_dims) {
+  tot=0
+  m=length(beta_dims)
+  for (j in 1:m) {
+    for (k in 1:(beta_dims[[j]][1])) {
+      for (l in 1:(beta_dims[[j]][2])) {
+        tot=tot+1
+      }
+    }
+  }
+  bvec=vector("numeric",length=tot)
+  d=1
+  for (j in 1:m) {
+    for (k in 1:(beta_dims[[j]][1])) {
+      for (l in 1:(beta_dims[[j]][2])) {
+        bvec[d]<-beta[[j]][k,l] 
+        d=d+1
+      }
+    }
+  }
+  return(bvec)
+}
+
+#turn the long vector version of beta back to the list it was
+bunvec<-function(bvec,beta_dims) {
+  m=length(beta_dims)
+  beta=vector("list",length=m)
+  for (j in 1:m) {
+    beta[[j]] <- array(0,dim=c(k=beta_dims[[j]][1],l=beta_dims[[j]][2]))
+  }  
+  d=1
+  for (j in 1:m) {
+    for (k in 1:(beta_dims[[j]][1])) {
+      for (l in 1:(beta_dims[[j]][2])) {
+        beta[[j]][k,l]<-bvec[d] 
+        d=d+1
+      }
+    }
+  }
+  return(beta)
+}
+
+#calculate the log likelihood as a function of P
+loglik <- function(data,P) {
+  data$Y*log(P)+(1-data$Y)*log(1-P)
+}
+lik <- function(data,P) {
+  (P^(data$Y))*(1-P)^((1-data$Y))
+}
+
+#the Frechet derivative of the ll wrt P
+DP.l <- function(data,P) {
+  function(h) {
+    (data$Y/P-(1-data$Y)/(1-P))*h
+  }
+}
+
+
+
+
+
+#Putting all the above together, here is a function that fits an RBC to a dataset with a binary outcome using quasi-Newton-Raphson optimisation via the optim command
+binRBC <- function(f_spec,p0,data,disp=NULL,method="Nelder",reltol=sqrt(.Machine$double.eps),maxit=100) {
+  if (method=="Nelder" & maxit==100) {
+    maxit=500
+  }
+  m=length(f_spec)
+  beta_dims=beta_dims_calc(f_spec,data)
+  
+  #this function calculates the (negative) log-likelihood at the current values of beta
+  floglik <- function(f_spec,p0,beta_vec,data) {
+    beta=bunvec(beta_vec,beta_dims)
+    return(-sum(loglik(data,f_compose(data,f_spec,beta,p0,m))))
+  }
+  flik <- function(f_spec,p0,beta_vec,data) {
+    beta=bunvec(beta_vec,beta_dims)
+    return(-prod(lik(data,f_compose(data,f_spec,beta,p0,m))))
+  }
+  
+  #this function calculates the gradient of the (negative) log-likelihood wrt beta
+  grloglik <- function(f_spec,p0,beta_vec,data) {
+    beta=bunvec(beta_vec,beta_dims)
+    n=nrow(data)
+    m=length(f_spec)
+    DX=as.data.frame(as.data.table(data[ , grepl( "^DX"  , names( data ) ) ]))
+    eta=vector("list",m)
+    Db.eta=vector("list",m)
+    DP.P=vector("list",m)
+    De.P=vector("list",m)
+    for (j in 1:m) {
+      DXj=as.data.frame(as.data.table(DX[ , grepl( paste("^DX",j,".",sep="") , names( DX ) ) ]))
+      metaj=make_etaj(DXj,beta[[j]])
+      eta[[j]] <- metaj[[1]]
+      Db.eta[[j]] <- metaj[[2]]
+      if (f_spec[j]==0) {
+        if (j>1) {
+          DP.P[[j]] <- DP.rd(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.rd(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(De.P[[j]])(1)
+        } else {
+          DP.P[[j]] <- DP.rd(eta = eta[[j]][,1], P = P0(data,p0))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.rd(eta = eta[[j]][,1], P = P0(data,p0))
+          force(De.P[[j]])(1)
+        }
+      }
+      if (f_spec[j]==1) {
+        if (j>1) {
+          DP.P[[j]] <- DP.rr(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.rr(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(De.P[[j]])(1)
+        } else {
+          DP.P[[j]] <- DP.rr(eta = eta[[j]][,1], P = P0(data,p0))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.rr(eta = eta[[j]][,1], P = P0(data,p0))
+          force(De.P[[j]])(1)
+        }
+      }
+      if (f_spec[j]==2) {
+        if (j>1) {
+          DP.P[[j]] <- DP.sr(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.sr(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(De.P[[j]])(1)
+        } else {
+          DP.P[[j]] <- DP.sr(eta = eta[[j]][,1], P = P0(data,p0))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.sr(eta = eta[[j]][,1], P = P0(data,p0))
+          force(De.P[[j]])(1)
+        }
+      }
+      if (f_spec[j]==3) {
+        if (j>1) {
+          DP.P[[j]] <- DP.or(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.or(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(De.P[[j]])(1)
+        } else {
+          DP.P[[j]] <- DP.or(eta = eta[[j]][,1], P = P0(data,p0))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.or(eta = eta[[j]][,1], P = P0(data,p0))
+          force(De.P[[j]])(1)
+        }
+      }
+      if (f_spec[j]==4) {
+        if (j>1) {
+          DP.P[[j]] <- DP.srr(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.srr(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(De.P[[j]])(1)
+        } else {
+          DP.P[[j]] <- DP.srr(eta = eta[[j]][,1], P = P0(data,p0))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.srr(eta = eta[[j]][,1], P = P0(data,p0))
+          force(De.P[[j]])(1)
+        }
+      }
+      if (f_spec[j]==5) {
+        if (j>1) {
+          DP.P[[j]] <- DP.probit(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.probit(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(De.P[[j]])(1)
+        } else {
+          DP.P[[j]] <- DP.probit(eta = eta[[j]][,1], P = P0(data,p0))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.probit(eta = eta[[j]][,1], P = P0(data,p0))
+          force(De.P[[j]])(1)
+        }
+      }
+      if (f_spec[j]==6) {
+        if (j>1) {
+          DP.P[[j]] <- DP.loglog(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.loglog(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(De.P[[j]])(1)
+        } else {
+          DP.P[[j]] <- DP.loglog(eta = eta[[j]][,1], P = P0(data,p0))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.loglog(eta = eta[[j]][,1], P = P0(data,p0))
+          force(De.P[[j]])(1)
+        }
+      }
+      if (f_spec[j]==7) {
+        if (j>1) {
+          DP.P[[j]] <- DP.cloglog(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.cloglog(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(De.P[[j]])(1)
+        } else {
+          DP.P[[j]] <- DP.cloglog(eta = eta[[j]][,1], P = P0(data,p0))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.cloglog(eta = eta[[j]][,1], P = P0(data,p0))
+          force(De.P[[j]])(1)
+        }
+      }
+      if (f_spec[j]==8) {
+        if (j>1) {
+          DP.P[[j]] <- DP.cauchit(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.cauchit(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(De.P[[j]])(1)
+        } else {
+          DP.P[[j]] <- DP.cauchit(eta = eta[[j]][,1], P = P0(data,p0))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.cauchit(eta = eta[[j]][,1], P = P0(data,p0))
+          force(De.P[[j]])(1)
+        }
+      }
+      if (f_spec[j]==9) {
+        if (j>1) {
+          DP.P[[j]] <- DP.arcsine(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.arcsine(eta = eta[[j]][,1], P = f_compose(data,f_spec,beta,p0,j-1))
+          force(De.P[[j]])(1)
+        } else {
+          DP.P[[j]] <- DP.arcsine(eta = eta[[j]][,1], P = P0(data,p0))
+          force(DP.P[[j]])(1)
+          De.P[[j]] <- De.arcsine(eta = eta[[j]][,1], P = P0(data,p0))
+          force(De.P[[j]])(1)
+        }
+      }
+    }
+    Frechet=vector("list",m)
+    evalFrechet=vector("list",m)
+    Ds=vector("list",m)
+    for (s in 1:m) {
+      Ds[[s]]=vector("list",m-s+2)
+      Ds[[s]][[1]]<-DP.l(data,f_compose(data,f_spec,beta,p0,m))
+      if (m>s) {
+        for (k in (2:(m-s+1))) {
+          Ds[[s]][[k]]<-DP.P[[m-k+2]]
+        }
+      } 
+      Ds[[s]][[m-s+2]]<-De.P[[s]]
+      Frechet[[s]]=do.call(Compose, Ds[[s]])
+      evalFrechet[[s]]=array(0,dim=c(k=beta_dims[[s]][1],l=beta_dims[[s]][2]))
+      for (t in 1:(beta_dims[[s]][1])) {
+        evalFrechet[[s]][t,1]<--sum(Frechet[[s]](as.matrix(as.data.frame((Db.eta[[s]](1))))[,t]))
+      }
+    }
+    return(bvec(evalFrechet,beta_dims))
+  }
+  
+  #initialise beta
+  beta=vector("list",m)
+  for (j in 1:m) {
+    betaj=array(0,dim=c(k=beta_dims[[j]][1],l=beta_dims[[j]][2]))
+    beta[[j]] <- betaj
+  }  
+  #beta[[1]][1,1]<--5.22037521
+  #beta[[1]][2,1]<-4.70052663
+  #beta[[1]][4,1]<--0.07993833
+  #beta[[1]][3,1]<-0.90291319
+  #beta[[1]][5,1]<-0.42838598
+  #beta[[2]][1,1]<-1.891
+  #beta[[2]][2,1]<--1.543
+  #beta[[2]][3,1]<--0.165
+  #beta[[2]][4,1]<-0.011
+  #beta[[2]][5,1]<-0.058
+  beta_vec=bvec(beta,beta_dims)
+  
+  #find the MLE of beta (and the Hessian matrix)
+  if (method=="Nelder") {
+    optim=optim(beta_vec, floglik, method=method,f_spec=f_spec,p0=p0,data=data,hessian=TRUE,control=list(reltol=reltol,maxit=maxit))
+  } else {
+    optim=optim(beta_vec, floglik, gr=grloglik, method=method,f_spec=f_spec,p0=p0,data=data,hessian=TRUE,control=list(reltol=reltol,maxit=maxit))
+  }
+  beta_MLE_vec=optim$par
+  CV_mat=inv(optim$hessian)
+  SEs_vec=sqrt(diag(CV_mat))
+  beta_MLE=bunvec(beta_MLE_vec,beta_dims)
+  SEs=bunvec(SEs_vec,beta_dims)
+  
+  #fitted probabilities and log-likelihood at the MLE:
+  fitted=f_compose(data,f_spec,beta_MLE,p0,m)
+  loglik=sum(data$Y*log(fitted)+(1-data$Y)*(1-fitted))
+  
+  #if the user has specified a list of covariate values at which to evaluate more predictions, this is done below:
+  disp_n=nrow(disp)
+  if (is.null(disp_n)==FALSE) {
+    P_mat=vector("list",disp_n)
+    for (i in 1:disp_n) {
+      P_mat[[i]]=matrix(NA,nrow=1,ncol=(m+1))
+      P_mat[[i]][,1]=p0
+      for (j in 1:m) {
+        data_tweaked=data
+        if (j+1<=m) {
+          for (k in (j+1):m) {
+            data_tweaked[ , grepl( paste("^DX",k,".",sep="") , names( data_tweaked ) )]<-0
+          }
+        }
+        for (k in 1:j) {
+          data_tweaked[ , grepl( paste("^DX",k,".",sep="") , names( data_tweaked ) )]<-disp[i,k]
+        }
+        P_mat[[i]][,j+1]<-f_compose(data_tweaked,f_spec,beta_MLE,p0,j)[1]
+      }
+    }
+  } else {
+    P_mat=NULL
+  }
+  
+  #also calculate the step-by-step predictions through the steps of the flow composition (this will be helpful when displaying the results of the model)
+  P_data=matrix(NA,ncol=(m+1),nrow=nrow(data))
+  P_data[,1]=p0
+  for (j in 1:m) {
+    P_data[,j+1]<-f_compose(data,f_spec,beta_MLE,p0,j)
+  }
+  
+  return(list(MLE=beta_MLE,SE=SEs,VCov=CV_mat,fit=fitted,loglik=loglik,P.disp=P_mat,P.data=P_data))
+}
+
+
+########################################################
+#              ANALYSIS OF SIMULATED DATA              #
+########################################################
+simvars<-matrix(nrow=10000,ncol=8)
+simvars[,1]=1
+#C:
+simvars[,2]=rnorm(10000)
+#X:
+simvars[,3]=runif(10000)<0.5
+#F:
+simvars[,4]=runif(10000)<0.5
+#W:
+simvars[,5]=runif(10000)<(1/(1+exp(-(1-simvars[,2]-2*simvars[,4]))))
+#D:
+simvars[,6]=runif(10000)<(1/(1+exp(-(2-4*simvars[,4]))))
+#Y:
+simvars[,7]=(1-simvars[,5])*(1-simvars[,3]*simvars[,6])
+#Prob(W=0|C):
+simvars[,8]=0.5*(1-(1/(1+exp(-(-1-simvars[,2])))))+0.5*(1-(1/(1+exp(-(1-simvars[,2])))))
+
+
+
+#Create the 5 different datasets with different baseline risk ranges
+
+data1<-as.data.frame(subset(simvars[,c(1,2,3,7)],simvars[,8]<0.2))
+data2<-as.data.frame(subset(simvars[,c(1,2,3,7)],simvars[,8]<0.4))
+data3<-as.data.frame(subset(simvars[,c(1,2,3,7)],simvars[,8]<0.6))
+data4<-as.data.frame(subset(simvars[,c(1,2,3,7)],simvars[,8]<0.8))
+data5<-as.data.frame(simvars[,c(1,2,3,7)])
+
+names(data1)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+names(data2)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+names(data3)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+names(data4)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+names(data5)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+
+
+#Analyse - first model 1 (logistic regression)
+
+p0=0.5
+f_spec=c(3,3,3)
+logreg1<-binRBC(f_spec,p0,data=data1,disp,method="CG",reltol=1e-10,maxit=1000)
+logreg2<-binRBC(f_spec,p0,data=data2,disp,method="CG",reltol=1e-10,maxit=1000)
+logreg3<-binRBC(f_spec,p0,data=data3,disp,method="CG",reltol=1e-10,maxit=1000)
+logreg4<-binRBC(f_spec,p0,data=data4,disp,method="CG",reltol=1e-10,maxit=1000)
+logreg5<-binRBC(f_spec,p0,data=data5,disp,method="CG",reltol=1e-10,maxit=1000)
+
+#Then model 2 (risk ratio for treatment)
+
+f_spec=c(3,3,1)
+rrreg1<-binRBC(f_spec,p0,data=data1,disp,method="CG",reltol=1e-10,maxit=1000)
+rrreg2<-binRBC(f_spec,p0,data=data2,disp,method="CG",reltol=1e-10,maxit=1000)
+rrreg3<-binRBC(f_spec,p0,data=data3,disp,method="CG",reltol=1e-10,maxit=1000)
+rrreg4<-binRBC(f_spec,p0,data=data4,disp,method="CG",reltol=1e-10,maxit=1000)
+rrreg5<-binRBC(f_spec,p0,data=data5,disp,method="CG",reltol=1e-10,maxit=1000)
+
+#Then model 3 (risk ratio and odds ratio for treatment)
+
+data1$DX4.V1<-data1$DX3.V1
+data2$DX4.V1<-data2$DX3.V1
+data3$DX4.V1<-data3$DX3.V1
+data4$DX4.V1<-data4$DX3.V1
+data5$DX4.V1<-data5$DX3.V1
+
+f_spec=c(3,3,3,1)
+mixedreg1<-binRBC(f_spec,p0,data=data1,disp,method="CG",reltol=1e-10,maxit=1000)
+mixedreg2<-binRBC(f_spec,p0,data=data2,disp,method="CG",reltol=1e-10,maxit=1000)
+mixedreg3<-binRBC(f_spec,p0,data=data3,disp,method="CG",reltol=1e-10,maxit=1000)
+mixedreg4<-binRBC(f_spec,p0,data=data4,disp,method="CG",reltol=1e-10,maxit=1000)
+mixedreg5<-binRBC(f_spec,p0,data=data5,disp,method="CG",reltol=1e-10,maxit=1000)
+
+#The next part of the code generates the 95% confidence regions
+
+data1<-as.data.frame(subset(simvars[,c(1,2,3,7)],simvars[,8]<0.2))
+data2<-as.data.frame(subset(simvars[,c(1,2,3,7)],simvars[,8]<0.4))
+data3<-as.data.frame(subset(simvars[,c(1,2,3,7)],simvars[,8]<0.6))
+data4<-as.data.frame(subset(simvars[,c(1,2,3,7)],simvars[,8]<0.8))
+data5<-as.data.frame(simvars[,c(1,2,3,7)])
+
+names(data1)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+names(data2)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+names(data3)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+names(data4)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+names(data5)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+
+f_spec=c(3,3,3)
+sample<-mvrnorm(100000,bvec(logreg1$MLE,beta_dims_calc(f_spec,data1))[3],logreg1$VCov[3,3])
+P=(seq(1:1001)-1)/1000
+M_a=(exp(sample[,1]))%*%t(as.matrix(P))
+M_b=1-(1-exp(sample[,1]))%*%t(as.matrix(P))
+M=(M_a/M_b)
+Est_logreg1=rep(0,1001)
+LCL_logreg1=rep(0,1001)
+UCL_logreg1=rep(0,1001)
+for (i in 1:1001) {
+  Est_logreg1[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_logreg1[i]<-qs[1]
+  UCL_logreg1[i]<-qs[2]
+}
+
+sample<-mvrnorm(100000,bvec(logreg2$MLE,beta_dims_calc(f_spec,data2))[3],logreg2$VCov[3,3])
+P=(seq(1:1001)-1)/1000
+M_a=(exp(sample[,1]))%*%t(as.matrix(P))
+M_b=1-(1-exp(sample[,1]))%*%t(as.matrix(P))
+M=(M_a/M_b)
+Est_logreg2=rep(0,1001)
+LCL_logreg2=rep(0,1001)
+UCL_logreg2=rep(0,1001)
+for (i in 1:1001) {
+  Est_logreg2[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_logreg2[i]<-qs[1]
+  UCL_logreg2[i]<-qs[2]
+}
+
+sample<-mvrnorm(100000,bvec(logreg3$MLE,beta_dims_calc(f_spec,data3))[3],logreg3$VCov[3,3])
+P=(seq(1:1001)-1)/1000
+M_a=(exp(sample[,1]))%*%t(as.matrix(P))
+M_b=1-(1-exp(sample[,1]))%*%t(as.matrix(P))
+M=(M_a/M_b)
+Est_logreg3=rep(0,1001)
+LCL_logreg3=rep(0,1001)
+UCL_logreg3=rep(0,1001)
+for (i in 1:1001) {
+  Est_logreg3[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_logreg3[i]<-qs[1]
+  UCL_logreg3[i]<-qs[2]
+}
+
+
+sample<-mvrnorm(100000,bvec(logreg4$MLE,beta_dims_calc(f_spec,data4))[3],logreg4$VCov[3,3])
+P=(seq(1:1001)-1)/1000
+M_a=(exp(sample[,1]))%*%t(as.matrix(P))
+M_b=1-(1-exp(sample[,1]))%*%t(as.matrix(P))
+M=(M_a/M_b)
+Est_logreg4=rep(0,1001)
+LCL_logreg4=rep(0,1001)
+UCL_logreg4=rep(0,1001)
+for (i in 1:1001) {
+  Est_logreg4[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_logreg4[i]<-qs[1]
+  UCL_logreg4[i]<-qs[2]
+}
+
+sample<-mvrnorm(100000,bvec(logreg5$MLE,beta_dims_calc(f_spec,data5))[3],logreg5$VCov[3,3])
+P=(seq(1:1001)-1)/1000
+M_a=(exp(sample[,1]))%*%t(as.matrix(P))
+M_b=1-(1-exp(sample[,1]))%*%t(as.matrix(P))
+M=(M_a/M_b)
+Est_logreg5=rep(0,1001)
+LCL_logreg5=rep(0,1001)
+UCL_logreg5=rep(0,1001)
+for (i in 1:1001) {
+  Est_logreg5[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_logreg5[i]<-qs[1]
+  UCL_logreg5[i]<-qs[2]
+}
+
+f_spec=c(3,3,1)
+sample<-mvrnorm(100000,bvec(rrreg1$MLE,beta_dims_calc(f_spec,data1))[3],rrreg1$VCov[3,3])
+P=(seq(1:1001)-1)/1000
+M=(exp(sample[,1]))%*%t(as.matrix(P))
+Est_rrreg1=rep(0,1001)
+LCL_rrreg1=rep(0,1001)
+UCL_rrreg1=rep(0,1001)
+for (i in 1:1001) {
+  Est_rrreg1[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_rrreg1[i]<-qs[1]
+  UCL_rrreg1[i]<-qs[2]
+}
+
+sample<-mvrnorm(100000,bvec(rrreg2$MLE,beta_dims_calc(f_spec,data2))[3],rrreg2$VCov[3,3])
+P=(seq(1:1001)-1)/1000
+M=(exp(sample[,1]))%*%t(as.matrix(P))
+Est_rrreg2=rep(0,1001)
+LCL_rrreg2=rep(0,1001)
+UCL_rrreg2=rep(0,1001)
+for (i in 1:1001) {
+  Est_rrreg2[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_rrreg2[i]<-qs[1]
+  UCL_rrreg2[i]<-qs[2]
+}
+
+sample<-mvrnorm(100000,bvec(rrreg3$MLE,beta_dims_calc(f_spec,data3))[3],rrreg3$VCov[3,3])
+P=(seq(1:1001)-1)/1000
+M=(exp(sample[,1]))%*%t(as.matrix(P))
+Est_rrreg3=rep(0,1001)
+LCL_rrreg3=rep(0,1001)
+UCL_rrreg3=rep(0,1001)
+for (i in 1:1001) {
+  Est_rrreg3[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_rrreg3[i]<-qs[1]
+  UCL_rrreg3[i]<-qs[2]
+}
+
+
+sample<-mvrnorm(100000,bvec(rrreg4$MLE,beta_dims_calc(f_spec,data4))[3],rrreg4$VCov[3,3])
+P=(seq(1:1001)-1)/1000
+M=(exp(sample[,1]))%*%t(as.matrix(P))
+Est_rrreg4=rep(0,1001)
+LCL_rrreg4=rep(0,1001)
+UCL_rrreg4=rep(0,1001)
+for (i in 1:1001) {
+  Est_rrreg4[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_rrreg4[i]<-qs[1]
+  UCL_rrreg4[i]<-qs[2]
+}
+
+sample<-mvrnorm(100000,bvec(rrreg5$MLE,beta_dims_calc(f_spec,data5))[3],rrreg5$VCov[3,3])
+P=(seq(1:1001)-1)/1000
+M=(exp(sample[,1]))%*%t(as.matrix(P))
+Est_rrreg5=rep(0,1001)
+LCL_rrreg5=rep(0,1001)
+UCL_rrreg5=rep(0,1001)
+for (i in 1:1001) {
+  Est_rrreg5[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_rrreg5[i]<-qs[1]
+  UCL_rrreg5[i]<-qs[2]
+}
+
+data1$DX4.V1<-data1$DX3.V1
+data2$DX4.V1<-data2$DX3.V1
+data3$DX4.V1<-data3$DX3.V1
+data4$DX4.V1<-data4$DX3.V1
+data5$DX4.V1<-data5$DX3.V1
+
+f_spec=c(3,3,3,1)
+sample<-mvrnorm(100000,bvec(mixedreg1$MLE,beta_dims_calc(f_spec,data1))[3:4],mixedreg1$VCov[3:4,3:4])
+P=(seq(1:1001)-1)/1000
+M_a=(exp(sample[,1]+sample[,2]))%*%t(as.matrix(P))
+M_b=1-(1-exp(sample[,1]))%*%t(as.matrix(P))
+M=(M_a/M_b)
+Est_mixed1=rep(0,1001)
+LCL_mixed1=rep(0,1001)
+UCL_mixed1=rep(0,1001)
+for (i in 1:1001) {
+  Est_mixed1[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_mixed1[i]<-qs[1]
+  UCL_mixed1[i]<-qs[2]
+}
+
+sample<-mvrnorm(100000,bvec(mixedreg2$MLE,beta_dims_calc(f_spec,data2))[3:4],mixedreg2$VCov[3:4,3:4])
+P=(seq(1:1001)-1)/1000
+M_a=(exp(sample[,1]+sample[,2]))%*%t(as.matrix(P))
+M_b=1-(1-exp(sample[,1]))%*%t(as.matrix(P))
+M=(M_a/M_b)
+Est_mixed2=rep(0,1001)
+LCL_mixed2=rep(0,1001)
+UCL_mixed2=rep(0,1001)
+for (i in 1:1001) {
+  Est_mixed2[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_mixed2[i]<-qs[1]
+  UCL_mixed2[i]<-qs[2]
+}
+
+
+sample<-mvrnorm(100000,bvec(mixedreg3$MLE,beta_dims_calc(f_spec,data3))[3:4],mixedreg3$VCov[3:4,3:4])
+P=(seq(1:1001)-1)/1000
+M_a=(exp(sample[,1]+sample[,2]))%*%t(as.matrix(P))
+M_b=1-(1-exp(sample[,1]))%*%t(as.matrix(P))
+M=(M_a/M_b)
+Est_mixed3=rep(0,1001)
+LCL_mixed3=rep(0,1001)
+UCL_mixed3=rep(0,1001)
+for (i in 1:1001) {
+  Est_mixed3[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_mixed3[i]<-qs[1]
+  UCL_mixed3[i]<-qs[2]
+}
+
+
+sample<-mvrnorm(100000,bvec(mixedreg4$MLE,beta_dims_calc(f_spec,data4))[3:4],mixedreg4$VCov[3:4,3:4])
+P=(seq(1:1001)-1)/1000
+M_a=(exp(sample[,1]+sample[,2]))%*%t(as.matrix(P))
+M_b=1-(1-exp(sample[,1]))%*%t(as.matrix(P))
+M=(M_a/M_b)
+Est_mixed4=rep(0,1001)
+LCL_mixed4=rep(0,1001)
+UCL_mixed4=rep(0,1001)
+for (i in 1:1001) {
+  Est_mixed4[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_mixed4[i]<-qs[1]
+  UCL_mixed4[i]<-qs[2]
+}
+
+
+sample<-mvrnorm(100000,bvec(mixedreg5$MLE,beta_dims_calc(f_spec,data5))[3:4],mixedreg5$VCov[3:4,3:4])
+P=(seq(1:1001)-1)/1000
+M_a=(exp(sample[,1]+sample[,2]))%*%t(as.matrix(P))
+M_b=1-(1-exp(sample[,1]))%*%t(as.matrix(P))
+M=(M_a/M_b)
+Est_mixed5=rep(0,1001)
+LCL_mixed5=rep(0,1001)
+UCL_mixed5=rep(0,1001)
+for (i in 1:1001) {
+  Est_mixed5[i]<-mean(M[,i])
+  qs=quantile(M[,i], probs = c(0.025,0.975))
+  LCL_mixed5[i]<-qs[1]
+  UCL_mixed5[i]<-qs[2]
+}
+
+
+data1<-as.data.frame(subset(simvars[,c(1,2,3,7)],simvars[,8]<0.2))
+data2<-as.data.frame(subset(simvars[,c(1,2,3,7)],simvars[,8]<0.4))
+data3<-as.data.frame(subset(simvars[,c(1,2,3,7)],simvars[,8]<0.6))
+data4<-as.data.frame(subset(simvars[,c(1,2,3,7)],simvars[,8]<0.8))
+data5<-as.data.frame(simvars[,c(1,2,3,7)])
+
+names(data1)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+names(data2)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+names(data3)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+names(data4)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+names(data5)<-c("DX1.V1","DX2.V1","DX3.V1","Y")
+
+
+
+#The final part of the code generates Figure 10 of the main manuscript
+
+truth1<-0.5*(1-(1/(1+exp(-(-1-simvars[,2])))))*(1-(1/(1+exp(-(-2)))))+0.5*(1-(1/(1+exp(-(1-simvars[,2])))))*(1-(1/(1+exp(-(2)))))
+truth0<-0.5*(1-(1/(1+exp(-(-1-simvars[,2])))))+0.5*(1-(1/(1+exp(-(1-simvars[,2])))))
+truth=cbind(truth0,truth1)
+truth=as.data.frame(truth)
+truth<-truth[order(truth$truth0), ]
+
+n=1001
+zo=matrix(0,n+1,1)
+zo[1:(round((n+1)/2,0))]=0
+zo[(round((n+1)/2,0)+1):(n+1)]=1
+plotting_data=as.data.frame(cbind(Est_logreg1,Est_logreg2,Est_logreg3,Est_logreg4,Est_logreg5,
+                                  Est_rrreg1,Est_rrreg2,Est_rrreg3,Est_rrreg4,Est_rrreg5,
+                                  Est_mixed1,Est_mixed2,Est_mixed3,Est_mixed4,Est_mixed5,
+                                  LCL_logreg1,LCL_logreg2,LCL_logreg3,LCL_logreg4,LCL_logreg5,
+                                  LCL_rrreg1,LCL_rrreg2,LCL_rrreg3,LCL_rrreg4,LCL_rrreg5,
+                                  LCL_mixed1,LCL_mixed2,LCL_mixed3,LCL_mixed4,LCL_mixed5,
+                                  UCL_logreg1,UCL_logreg2,UCL_logreg3,UCL_logreg4,UCL_logreg5,
+                                  UCL_rrreg1,UCL_rrreg2,UCL_rrreg3,UCL_rrreg4,UCL_rrreg5,
+                                  UCL_mixed1,UCL_mixed2,UCL_mixed3,UCL_mixed4,UCL_mixed5,zo,P))
+colnames(plotting_data)<-c(sprintf("Est_logreg%d", 1:5),sprintf("Est_rrreg%d", 1:5),sprintf("Est_mixed%d", 1:5),
+                  sprintf("LCL_logreg%d", 1:5),sprintf("LCL_rrreg%d", 1:5),sprintf("LCL_mixed%d", 1:5),
+                  sprintf("UCL_logreg%d", 1:5),sprintf("UCL_rrreg%d", 1:5),sprintf("UCL_mixed%d", 1:5),"V7","P")
+
+
+
+
+dfNA<-as.data.frame(matrix(NA,ncol=47,nrow=8998))
+colnames(dfNA)<-c(sprintf("Est_logreg%d", 1:5),sprintf("Est_rrreg%d", 1:5),sprintf("Est_mixed%d", 1:5),
+                           sprintf("LCL_logreg%d", 1:5),sprintf("LCL_rrreg%d", 1:5),sprintf("LCL_mixed%d", 1:5),
+                           sprintf("UCL_logreg%d", 1:5),sprintf("UCL_rrreg%d", 1:5),sprintf("UCL_mixed%d", 1:5),"V7","P")
+
+plotting_data<-rbind(plotting_data,dfNA)
+plotting_data<-cbind(truth,plotting_data)
+
+
+
+lr_xval1<-c(or(0.5,as.numeric(logreg1$MLE[[1]])+as.numeric(logreg1$MLE[[2]])*as.vector(data1$DX2.V1)),rep(NA,(10000-nrow(data1))))
+lr_xval2<-c(or(0.5,as.numeric(logreg2$MLE[[1]])+as.numeric(logreg2$MLE[[2]])*as.vector(data2$DX2.V1)),rep(NA,(10000-nrow(data2))))
+lr_xval3<-c(or(0.5,as.numeric(logreg3$MLE[[1]])+as.numeric(logreg3$MLE[[2]])*as.vector(data3$DX2.V1)),rep(NA,(10000-nrow(data3))))
+lr_xval4<-c(or(0.5,as.numeric(logreg4$MLE[[1]])+as.numeric(logreg4$MLE[[2]])*as.vector(data4$DX2.V1)),rep(NA,(10000-nrow(data4))))
+lr_xval5<-or(0.5,as.numeric(logreg5$MLE[[1]])+as.numeric(logreg5$MLE[[2]])*as.vector(data5$DX2.V1))
+
+rr_xval1<-c(or(0.5,as.numeric(rrreg1$MLE[[1]])+as.numeric(rrreg1$MLE[[2]])*as.vector(data1$DX2.V1)),rep(NA,(10000-nrow(data1))))
+rr_xval2<-c(or(0.5,as.numeric(rrreg2$MLE[[1]])+as.numeric(rrreg2$MLE[[2]])*as.vector(data2$DX2.V1)),rep(NA,(10000-nrow(data2))))
+rr_xval3<-c(or(0.5,as.numeric(rrreg3$MLE[[1]])+as.numeric(rrreg3$MLE[[2]])*as.vector(data3$DX2.V1)),rep(NA,(10000-nrow(data3))))
+rr_xval4<-c(or(0.5,as.numeric(rrreg4$MLE[[1]])+as.numeric(rrreg4$MLE[[2]])*as.vector(data4$DX2.V1)),rep(NA,(10000-nrow(data4))))
+rr_xval5<-or(0.5,as.numeric(rrreg5$MLE[[1]])+as.numeric(rrreg5$MLE[[2]])*as.vector(data5$DX2.V1))
+
+m_xval1<-c(or(0.5,as.numeric(mixedreg1$MLE[[1]])+as.numeric(mixedreg1$MLE[[2]])*as.vector(data1$DX2.V1)),rep(NA,(10000-nrow(data1))))
+m_xval2<-c(or(0.5,as.numeric(mixedreg2$MLE[[1]])+as.numeric(mixedreg2$MLE[[2]])*as.vector(data2$DX2.V1)),rep(NA,(10000-nrow(data2))))
+m_xval3<-c(or(0.5,as.numeric(mixedreg3$MLE[[1]])+as.numeric(mixedreg3$MLE[[2]])*as.vector(data3$DX2.V1)),rep(NA,(10000-nrow(data3))))
+m_xval4<-c(or(0.5,as.numeric(mixedreg4$MLE[[1]])+as.numeric(mixedreg4$MLE[[2]])*as.vector(data4$DX2.V1)),rep(NA,(10000-nrow(data4))))
+m_xval5<-or(0.5,as.numeric(mixedreg5$MLE[[1]])+as.numeric(mixedreg5$MLE[[2]])*as.vector(data5$DX2.V1))
+
+
+plotting_data<-cbind(plotting_data,lr_xval1,lr_xval2,lr_xval3,lr_xval4,lr_xval5,
+                     rr_xval1,rr_xval2,rr_xval3,rr_xval4,rr_xval5,
+                     m_xval1,m_xval2,m_xval3,m_xval4,m_xval5)
+
+plotting_data$truth0[1]<-0
+plotting_data$truth0[10000]<-1
+plotting_data$truth1[1]<-0
+plotting_data$truth1[10000]<-0.5
+
+plotting_data$Est_mixed1<-ifelse(plotting_data$Est_mixed1<=1 & plotting_data$Est_mixed1>=0,plotting_data$Est_mixed1,ifelse(plotting_data$Est_mixed1<0,0,1)) 
+plotting_data$Est_mixed2<-ifelse(plotting_data$Est_mixed2<=1 & plotting_data$Est_mixed2>=0,plotting_data$Est_mixed2,ifelse(plotting_data$Est_mixed2<0,0,1)) 
+plotting_data$Est_mixed3<-ifelse(plotting_data$Est_mixed3<=1 & plotting_data$Est_mixed3>=0,plotting_data$Est_mixed3,ifelse(plotting_data$Est_mixed3<0,0,1)) 
+plotting_data$Est_mixed4<-ifelse(plotting_data$Est_mixed4<=1 & plotting_data$Est_mixed4>=0,plotting_data$Est_mixed4,ifelse(plotting_data$Est_mixed4<0,0,1)) 
+plotting_data$Est_mixed5<-ifelse(plotting_data$Est_mixed5<=1 & plotting_data$Est_mixed5>=0,plotting_data$Est_mixed5,ifelse(plotting_data$Est_mixed5<0,0,1)) 
+plotting_data$LCL_mixed1<-ifelse(plotting_data$LCL_mixed1<=1 & plotting_data$LCL_mixed1>=0,plotting_data$LCL_mixed1,ifelse(plotting_data$LCL_mixed1<0,0,1)) 
+plotting_data$LCL_mixed2<-ifelse(plotting_data$LCL_mixed2<=1 & plotting_data$LCL_mixed2>=0,plotting_data$LCL_mixed2,ifelse(plotting_data$LCL_mixed2<0,0,1)) 
+plotting_data$LCL_mixed3<-ifelse(plotting_data$LCL_mixed3<=1 & plotting_data$LCL_mixed3>=0,plotting_data$LCL_mixed3,ifelse(plotting_data$LCL_mixed3<0,0,1)) 
+plotting_data$LCL_mixed4<-ifelse(plotting_data$LCL_mixed4<=1 & plotting_data$LCL_mixed4>=0,plotting_data$LCL_mixed4,ifelse(plotting_data$LCL_mixed4<0,0,1)) 
+plotting_data$LCL_mixed5<-ifelse(plotting_data$LCL_mixed5<=1 & plotting_data$LCL_mixed5>=0,plotting_data$LCL_mixed5,ifelse(plotting_data$LCL_mixed5<0,0,1)) 
+plotting_data$UCL_mixed1<-ifelse(plotting_data$UCL_mixed1<=1 & plotting_data$UCL_mixed1>=0,plotting_data$UCL_mixed1,ifelse(plotting_data$UCL_mixed1<0,0,1)) 
+plotting_data$UCL_mixed2<-ifelse(plotting_data$UCL_mixed2<=1 & plotting_data$UCL_mixed2>=0,plotting_data$UCL_mixed2,ifelse(plotting_data$UCL_mixed2<0,0,1)) 
+plotting_data$UCL_mixed3<-ifelse(plotting_data$UCL_mixed3<=1 & plotting_data$UCL_mixed3>=0,plotting_data$UCL_mixed3,ifelse(plotting_data$UCL_mixed3<0,0,1)) 
+plotting_data$UCL_mixed4<-ifelse(plotting_data$UCL_mixed4<=1 & plotting_data$UCL_mixed4>=0,plotting_data$UCL_mixed4,ifelse(plotting_data$UCL_mixed4<0,0,1)) 
+plotting_data$UCL_mixed5<-ifelse(plotting_data$UCL_mixed5<=1 & plotting_data$UCL_mixed5>=0,plotting_data$UCL_mixed5,ifelse(plotting_data$UCL_mixed5<0,0,1)) 
+
+plotting_data$Est_mixed1<-ifelse(plotting_data$Est_mixed1==1,NA,plotting_data$Est_mixed1)
+plotting_data$Est_mixed2<-ifelse(plotting_data$Est_mixed2==1,NA,plotting_data$Est_mixed2)
+plotting_data$Est_mixed3<-ifelse(plotting_data$Est_mixed3==1,NA,plotting_data$Est_mixed3)
+
+plot_11<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +  
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(),
+        axis.title.y = element_text(size=9), axis.text.y = element_text(size=6),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_text(size=9,hjust=0.5)) + 
+  labs(title="v low risk only \n (n = 471)") +
+  ylab("Logistic regression \n \n P1") + coord_fixed() +
+geom_line(data=plotting_data,aes(x=P,y=Est_logreg1),color='purple') +
+geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_logreg1,ymax=UCL_logreg1),alpha=0.3) +
+geom_point(data=plotting_data,aes(x=lr_xval1,y=0),alpha=0.1)
+
+
+plot_12<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(),
+        axis.title.y = element_blank(), axis.text.y = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_text(size=9,hjust=0.5)) + 
+  labs(title="low risk only \n (n = 3,062)") +
+coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_logreg2),color='purple') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_logreg2,ymax=UCL_logreg2),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=lr_xval2,y=0),alpha=0.1)
+
+
+plot_13<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(),
+        axis.title.y = element_blank(), axis.text.y = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_text(size=9,hjust=0.5)) + 
+  labs(title="excluding high risk \n (n = 6,927)") +
+coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_logreg3),color='purple') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_logreg3,ymax=UCL_logreg3),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=lr_xval3,y=0),alpha=0.1)
+
+plot_14<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(),
+        axis.title.y = element_blank(), axis.text.y = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_text(size=9,hjust=0.5)) + 
+  labs(title="excluding v high risk \n (n = 9,559)") +
+  coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_logreg4),color='purple') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_logreg4,ymax=UCL_logreg4),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=lr_xval4,y=0),alpha=0.1)
+
+plot_15<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(),
+        axis.title.y = element_blank(), axis.text.y = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_text(size=9,hjust=0.5)) + 
+  labs(title="everyone \n (n = 10,000)") +
+  coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_logreg5),color='purple') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_logreg5,ymax=UCL_logreg5),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=lr_xval5,y=0),alpha=0.1)
+
+plotting_data$UCL_rrreg1b<-ifelse(plotting_data$UCL_rrreg1<=1,plotting_data$UCL_rrreg1,1)
+plot_21<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(),
+        axis.title.y = element_text(size=9), axis.text.y = element_text(size=6),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_blank()) +   
+  ylab("Risk ratio transf. for treatment \n \n P1") + coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_rrreg1),color='orange') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_rrreg1,ymax=UCL_rrreg1b),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=rr_xval1,y=0),alpha=0.1)
+
+
+plot_22<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(),
+        axis.title.y = element_blank(), axis.text.y = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_blank()) +   
+  coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_rrreg2),color='orange') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_rrreg2,ymax=UCL_rrreg2),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=rr_xval2,y=0),alpha=0.1)
+
+
+plot_23<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(),
+        axis.title.y = element_blank(), axis.text.y = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_blank()) +   
+  coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_rrreg3),color='orange') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_rrreg3,ymax=UCL_rrreg3),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=rr_xval3,y=0),alpha=0.1)
+
+plot_24<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(),
+        axis.title.y = element_blank(), axis.text.y = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_blank()) +   
+  coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_rrreg4),color='orange') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_rrreg4,ymax=UCL_rrreg4),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=rr_xval4,y=0),alpha=0.1)
+
+plot_25<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_blank(), axis.text.x = element_blank(),
+        axis.title.y = element_blank(), axis.text.y = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_blank()) +   
+  coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_rrreg5),color='orange') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_rrreg5,ymax=UCL_rrreg5),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=rr_xval5,y=0),alpha=0.1)
+
+
+plot_31<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_text(size=9), axis.text.x = element_text(size=6),
+        axis.title.y = element_text(size=9), axis.text.y = element_text(size=6),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_blank()) +   
+  xlab("P0") + ylab("Dual (OR and RR) transf. for treatment \n \n P1") + coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_mixed1),color='navy') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_mixed1,ymax=UCL_mixed1),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=m_xval1,y=0),alpha=0.1)
+
+
+plot_32<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_text(size=9), axis.text.x = element_text(size=6),
+        axis.title.y = element_blank(), axis.text.y = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_blank()) +   
+  xlab("P0")  + coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_mixed2),color='navy') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_mixed2,ymax=UCL_mixed2),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=m_xval2,y=0),alpha=0.1)
+
+
+plot_33<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_text(size=9), axis.text.x = element_text(size=6),
+        axis.title.y = element_blank(), axis.text.y = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_blank()) +   
+  xlab("P0") + coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_mixed3),color='navy') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_mixed3,ymax=UCL_mixed3),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=m_xval3,y=0),alpha=0.1)
+
+plot_34<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_text(size=9), axis.text.x = element_text(size=6),
+        axis.title.y = element_blank(), axis.text.y = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_blank()) +   
+  xlab("P0") + coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_mixed4),color='navy') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_mixed4,ymax=UCL_mixed4),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=m_xval4,y=0),alpha=0.1)
+
+plot_35<-ggplot(plotting_data, aes(x=V7,y=V7)) +
+  geom_line(linetype="dotted") +
+  geom_line(aes(x=truth0,
+                y=truth1),color='green') +
+  theme_classic() + 
+  theme(plot.margin = unit(c(0.2,0.2,0.2,0.2), "cm")) +
+  scale_x_continuous(expand = expansion(add = c(0.01, 0.01))) +    
+  scale_y_continuous(limits=c(0, 1)) +  
+  theme(axis.title.x = element_text(size=9), axis.text.x = element_text(size=6),
+        axis.title.y = element_blank(), axis.text.y = element_blank(),
+        panel.border = element_rect(color = "black", fill = NA, size = 1),
+        axis.line.y = element_blank(),axis.line.x = element_blank(),
+        plot.title = element_blank()) +   
+  xlab("P0") + coord_fixed() +
+  geom_line(data=plotting_data,aes(x=P,y=Est_mixed5),color='navy') +
+  geom_ribbon(data=plotting_data,aes(x=P,ymin=LCL_mixed5,ymax=UCL_mixed5),alpha=0.3) +
+  geom_point(data=plotting_data,aes(x=m_xval5,y=0),alpha=0.1)
+
+
+final_plot <- (plot_11 | plot_12 | plot_13 | plot_14 | plot_15)/
+   (plot_21 | plot_22 | plot_23 | plot_24 | plot_25)/ 
+   (plot_31 | plot_32 | plot_33 | plot_34 | plot_35)
